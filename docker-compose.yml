@@ -4,6 +4,10 @@ services:
             context: .
         environment:
             - PIP_INDEX_URL=https://aws:${CODEARTIFACT_AUTH_TOKEN}@eventbrite-shared-353605023268.d.codeartifact.us-east-1.amazonaws.com/pypi/python/simple/
+            - MYSQL_TEST_ADDR=mysql
+            - MYSQL_TEST_PORT=3306
+            - MYSQL_TEST_USER=root
+            - MYSQL_TEST_PASSWORD=unitTestPassword
         depends_on:
             mysql:
                 condition: service_healthy
