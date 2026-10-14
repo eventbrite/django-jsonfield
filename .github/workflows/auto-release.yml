@@ -1,0 +1,107 @@
+name: auto-release
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write        # push the release branch
+  pull-requests: write   # open the release PR
+  statuses: read         # REQUIRED: read the CircleCI commit status (else HTTP 403)
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+env:
+  # ---- EDIT THESE (must match tasks.py configure_release_parameters) ----
+  MODULE: jsonfield
+  DISPLAY_NAME: jsonfield Library
+  PYTHON_DIRECTORY: ""          # e.g. "python" for eb_constants; empty if the package is at the root
+  BASE: main
+  # The CircleCI job that must pass first, as a commit-status context.
+  STATUS_CONTEXT: "ci/circleci: test-main"
+  # require       = wait for STATUS_CONTEXT to succeed; skip on failure/timeout.
+  # opportunistic = wait if STATUS_CONTEXT appears, otherwise proceed after a
+  #                 short grace period (for repos with no main-branch test job).
+  GATE_MODE: require
+
+jobs:
+  auto-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CircleCI test job
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Subsequent steps only run if we explicitly set this to "true".
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth="Authorization: token ${GITHUB_TOKEN}"
+
+          subject=$(curl -fsS -H "$auth" "$api/commits/${GITHUB_SHA}" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['commit']['message'].splitlines()[0])" 2>/dev/null) || subject=""
+          if [[ "$subject" == "Released ${DISPLAY_NAME} version"* ]]; then
+            echo "HEAD is a release commit; nothing to release."
+            exit 0
+          fi
+
+          echo "Waiting for ${STATUS_CONTEXT} on ${GITHUB_SHA}..."
+          state="missing"
+          missing=0
+          for _ in $(seq 1 90); do
+            state=$(curl -fsS -H "$auth" "$api/commits/${GITHUB_SHA}/status" \
+              | python3 -c "import sys,json;s=[x for x in json.load(sys.stdin)['statuses'] if x['context']=='${STATUS_CONTEXT}'];print(s[0]['state'] if s else 'missing')" 2>/dev/null) || state="unknown"
+            echo "  ${STATUS_CONTEXT} -> ${state}"
+            if [[ "$state" == "success" ]]; then
+              break
+            fi
+            if [[ "$state" == "failure" || "$state" == "error" ]]; then
+              echo "test job did not pass; skipping the release."
+              exit 0
+            fi
+            if [[ "$state" == "missing" || "$state" == "unknown" ]]; then
+              missing=$((missing + 1))
+              if [[ "${GATE_MODE}" != "require" && "$missing" -ge 9 ]]; then
+                echo "No ${STATUS_CONTEXT} appeared; proceeding (opportunistic)."
+                echo "proceed=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              missing=0
+            fi
+            sleep 20
+          done
+
+          if [[ "$state" != "success" ]]; then
+            echo "Timed out waiting for the test job; skipping the release."
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open automatic release PR
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone --quiet "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          # Release exactly the commit whose test job the gate verified. A bare
+          # clone lands on the current tip; checking out ${GITHUB_SHA} pins the
+          # release to the gated commit. If main has advanced since, the script's
+          # HEAD-vs-origin/<base> guard skips this run, and the newer commit's own
+          # run (which gates on its own test job) handles the release.
+          git checkout --quiet "${GITHUB_SHA}"
+          python3 scripts/auto_release.py \
+            --module "${MODULE}" \
+            --display-name "${DISPLAY_NAME}" \
+            --python-directory "${PYTHON_DIRECTORY}" \
+            --base "${BASE}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --github-token="${GITHUB_TOKEN}"
